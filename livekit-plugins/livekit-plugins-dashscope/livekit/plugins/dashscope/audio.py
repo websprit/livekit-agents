@@ -33,8 +33,16 @@ def parse_asr_event(message: dict) -> tuple[str, bool]:
     header = message.get("header") or {}
     payload = message.get("payload") or {}
     output = payload.get("output") or {}
-    text = (output.get("sentence") or output.get("text") or "").strip()
-    finished = header.get("event") in {"task-finished", "result-generated"} and bool(output.get("sentence_end", header.get("event") == "task-finished"))
+    sentence = output.get("sentence")
+    if isinstance(sentence, dict):
+        text = (sentence.get("text") or "").strip()
+        ended = bool(sentence.get("sentence_end"))
+    else:
+        raw = sentence or output.get("text") or ""
+        text = raw.strip() if isinstance(raw, str) else ""
+        ended = bool(output.get("sentence_end"))
+    event = header.get("event")
+    finished = event == "task-finished" or (event == "result-generated" and ended)
     return text, finished
 
 
@@ -74,3 +82,110 @@ def authorization_header(api_key: str) -> dict:
 
 def dumps(message: dict) -> str:
     return json.dumps(message, ensure_ascii=False, separators=(",", ":"))
+
+
+def _finish_task(task_id: str) -> dict:
+    return {
+        "header": {"action": "finish-task", "task_id": task_id, "streaming": "duplex"},
+        "payload": {"input": {}},
+    }
+
+
+async def transcribe_pcm(
+    api_key: str,
+    model: str,
+    pcm: bytes,
+    *,
+    url: str,
+    sample_rate: int = 16000,
+    language: str = "zh",
+) -> str:
+    """Open the Bailian ASR websocket and return the final transcript."""
+    import asyncio
+
+    import websockets
+
+    task = asr_run_task(model, language=language or "zh")
+    task_id = task["header"]["task_id"]
+    finals: list[str] = []
+    latest = ""
+    async with websockets.connect(
+        url,
+        additional_headers={"Authorization": f"Bearer {api_key}"},
+        open_timeout=20,
+        max_size=8_000_000,
+    ) as ws:
+        await ws.send(dumps(task))
+        started = False
+        for _ in range(6):
+            raw = await asyncio.wait_for(ws.recv(), 15)
+            if not isinstance(raw, str):
+                continue
+            event = json.loads(raw)
+            name = (event.get("header") or {}).get("event")
+            if name == "task-started":
+                started = True
+                break
+            if name == "task-failed":
+                raise RuntimeError(raw[:400])
+        if not started:
+            raise RuntimeError("dashscope asr did not start")
+        for offset in range(0, len(pcm), 3200):
+            await ws.send(pcm[offset : offset + 3200])
+        await ws.send(dumps(_finish_task(task_id)))
+        for _ in range(40):
+            raw = await asyncio.wait_for(ws.recv(), 15)
+            if not isinstance(raw, str):
+                continue
+            event = json.loads(raw)
+            text, ended = parse_asr_event(event)
+            if text:
+                latest = text
+            if ended and text:
+                finals.append(text)
+            if (event.get("header") or {}).get("event") in {"task-finished", "task-failed"}:
+                if (event.get("header") or {}).get("event") == "task-failed":
+                    raise RuntimeError(raw[:400])
+                break
+    return "".join(finals) or latest
+
+
+def _download_tts(api_key: str, url: str, body: dict) -> bytes:
+    import urllib.request
+
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode(),
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        payload = json.loads(resp.read().decode())
+    audio = (payload.get("output") or {}).get("audio") or {}
+    audio_url = audio.get("url") if isinstance(audio, dict) else ""
+    if not audio_url:
+        raise RuntimeError("dashscope tts response has no audio url")
+    with urllib.request.urlopen(audio_url, timeout=60) as audio_resp:
+        return audio_resp.read()
+
+
+async def synthesize_speech(
+    api_key: str,
+    model: str,
+    text: str,
+    *,
+    url: str,
+    voice: str = "",
+) -> bytes:
+    """Call Bailian SpeechSynthesizer and return the WAV bytes."""
+    import asyncio
+
+    body = {
+        "model": model,
+        "input": {
+            "text": text,
+            "voice": voice or "longanhuan_v3.1",
+            "format": "wav",
+            "sample_rate": 24000,
+        },
+    }
+    return await asyncio.to_thread(_download_tts, api_key, url, body)
